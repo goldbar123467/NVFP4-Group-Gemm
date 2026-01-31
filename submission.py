@@ -141,7 +141,7 @@ def kernel(
 
     # Initialize pipelines
     ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-    ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
+    ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, threads_per_cta)
     ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
         num_stages=num_ab_stage,
@@ -310,12 +310,15 @@ def kernel(
     tAgSFA = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
     tBgSFB = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
-    # Main loop
-    if warp_idx == 0:
-        acc_empty = acc_producer.acquire_and_advance()
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+    # ALL THREADS: Initialize accumulator pipeline
+    acc_empty = acc_producer.acquire_and_advance()
+    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
-        for k_tile in range(k_tile_cnt):
+    # Main loop
+    num_kblocks = cute.size(tCrA, mode=[2])
+    for k_tile in range(k_tile_cnt):
+        # WARP 0 ONLY: Issue TMA loads (hardware requirement)
+        if warp_idx == 0:
             ab_empty = ab_producer.acquire_and_advance()
 
             cute.copy(tma_atom_a, tAgA[(None, k_tile)], tAsA[(None, ab_empty.index)],
@@ -331,25 +334,30 @@ def kernel(
                 tma_bar_ptr=ab_empty.barrier,
                 tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
 
-            ab_full = ab_consumer.wait_and_advance()
+        # ALL THREADS: Wait for TMA data
+        ab_full = ab_consumer.wait_and_advance()
 
-            s2t_stage_coord = (None, None, None, None, ab_full.index)
-            tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
-            tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
-            cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t_staged, tCtSFA_compact_s2t)
-            cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t_staged, tCtSFB_compact_s2t)
+        # ALL THREADS: S2T copy scale factors to tensor memory
+        s2t_stage_coord = (None, None, None, None, ab_full.index)
+        tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
+        tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
+        cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t_staged, tCtSFA_compact_s2t)
+        cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t_staged, tCtSFB_compact_s2t)
 
-            num_kblocks = cute.size(tCrA, mode=[2])
-            for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                kblock_coord = (None, None, kblock_idx, ab_full.index)
-                sf_kblock_coord = (None, None, kblock_idx)
-                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
-                cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
-                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        # ALL THREADS: MMA compute (cooperative instruction)
+        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+            kblock_coord = (None, None, kblock_idx, ab_full.index)
+            sf_kblock_coord = (None, None, kblock_idx)
+            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+            cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-            ab_full.release()
-        acc_empty.commit()
+        # ALL THREADS: Release buffer
+        ab_full.release()
+
+    # ALL THREADS: Commit accumulator
+    acc_empty.commit()
 
     # Epilogue
     op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x128, tcgen05.Pack.NONE)
