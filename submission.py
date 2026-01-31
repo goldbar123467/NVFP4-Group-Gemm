@@ -1,6 +1,8 @@
 """
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
 CuTe DSL Implementation using CUTLASS
+
+VERSION: v7-clean-20260124
 """
 
 import cutlass
@@ -310,15 +312,12 @@ def kernel(
     tAgSFA = tAgSFA[(None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])]
     tBgSFB = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
-    # ALL THREADS: Initialize accumulator pipeline
-    acc_empty = acc_producer.acquire_and_advance()
-    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
     # Main loop
-    num_kblocks = cute.size(tCrA, mode=[2])
-    for k_tile in range(k_tile_cnt):
-        # WARP 0 ONLY: TMA loads, pipeline wait, and S2T copies
-        if warp_idx == 0:
+    if warp_idx == 0:
+        acc_empty = acc_producer.acquire_and_advance()
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+        for k_tile in range(k_tile_cnt):
             ab_empty = ab_producer.acquire_and_advance()
 
             cute.copy(tma_atom_a, tAgA[(None, k_tile)], tAsA[(None, ab_empty.index)],
@@ -336,35 +335,23 @@ def kernel(
 
             ab_full = ab_consumer.wait_and_advance()
 
-            # S2T copy scale factors to tensor memory
             s2t_stage_coord = (None, None, None, None, ab_full.index)
             tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
             tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
             cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t_staged, tCtSFA_compact_s2t)
             cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t_staged, tCtSFB_compact_s2t)
 
-        # ALL THREADS: Sync after data loaded to smem/tmem
-        cute.arch.barrier()
+            num_kblocks = cute.size(tCrA, mode=[2])
+            for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
+                kblock_coord = (None, None, kblock_idx, ab_full.index)
+                sf_kblock_coord = (None, None, kblock_idx)
+                tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
+                tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
+                cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
+                tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-        # ALL THREADS: MMA compute (cooperative instruction)
-        # Stage index is always 0 since num_ab_stage=1
-        for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-            kblock_coord = (None, None, kblock_idx, 0)
-            sf_kblock_coord = (None, None, kblock_idx)
-            tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
-            tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
-            cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
-            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-
-        # ALL THREADS: Sync before buffer release
-        cute.arch.barrier()
-
-        # WARP 0 ONLY: Release buffer
-        if warp_idx == 0:
             ab_full.release()
-
-    # ALL THREADS: Commit accumulator
-    acc_empty.commit()
+        acc_empty.commit()
 
     # Epilogue
     op = tcgen05.Ld32x32bOp(tcgen05.Repetition.x128, tcgen05.Pack.NONE)
@@ -460,9 +447,6 @@ def my_kernel(
         cute.make_layout((1, 1, 1)), (tiled_mma.thr_id.shape,)
     )
 
-    # CUTLASS sm100_utils helpers return ComposedLayout with proper 128-byte swizzle
-    # for Blackwell shared memory. The swizzle is extracted via .inner and applied
-    # during smem.allocate_tensor() in the kernel function.
     a_smem_layout_staged = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, ab_dtype, num_ab_stage)
     b_smem_layout_staged = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, ab_dtype, num_ab_stage)
     sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, num_ab_stage)
