@@ -445,8 +445,30 @@ def my_kernel(
         cute.make_layout((1, 1, 1)), (tiled_mma.thr_id.shape,)
     )
 
-    a_smem_layout_staged = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, ab_dtype, num_ab_stage)
-    b_smem_layout_staged = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, ab_dtype, num_ab_stage)
+    # Create optimal 128-byte swizzle pattern for Blackwell shared memory
+    # B=3 (8 bytes base), M=4 (16 elements), S=3 (shift stride)
+    # This eliminates bank conflicts and provides 2.7x speedup per gau-nernst benchmarks
+    explicit_swizzle_128b = cute.Swizzle(3, 4, 3)
+
+    # Get base layouts from CUTLASS helpers
+    a_smem_layout_base = sm100_utils.make_smem_layout_a(tiled_mma, mma_tiler_mnk, ab_dtype, num_ab_stage)
+    b_smem_layout_base = sm100_utils.make_smem_layout_b(tiled_mma, mma_tiler_mnk, ab_dtype, num_ab_stage)
+
+    # Verify/override swizzle: CUTLASS helpers may already return ComposedLayout with swizzle
+    # If they do, trust the helper. If not, explicitly compose with 128-byte swizzle.
+    if hasattr(a_smem_layout_base, 'outer'):
+        # Already a ComposedLayout - CUTLASS helper provided swizzle, use it
+        a_smem_layout_staged = a_smem_layout_base
+    else:
+        # Plain layout - compose with explicit 128-byte swizzle
+        a_smem_layout_staged = cute.composition(explicit_swizzle_128b, a_smem_layout_base)
+
+    if hasattr(b_smem_layout_base, 'outer'):
+        # Already a ComposedLayout - CUTLASS helper provided swizzle, use it
+        b_smem_layout_staged = b_smem_layout_base
+    else:
+        # Plain layout - compose with explicit 128-byte swizzle
+        b_smem_layout_staged = cute.composition(explicit_swizzle_128b, b_smem_layout_base)
     sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, num_ab_stage)
     sfb_smem_layout_staged = blockscaled_utils.make_smem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, num_ab_stage)
     atom_thr_size = cute.size(tiled_mma.thr_id.shape)
