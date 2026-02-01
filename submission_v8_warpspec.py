@@ -259,13 +259,12 @@ def kernel(
     # computes tile N, hiding TMA latency.
     # =========================================================================
 
-    # Producer group: Only warp 0 issues TMA commands
-    # Using Thread agent with no count = all threads in calling warp
+    # Producer group: Warp 0 issues TMA commands
     ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-    # Consumer group: One warp consumes (warp 1)
-    # Using Thread agent with count = 32 (one warp worth of threads)
-    ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 32)
+    # Consumer group: Single thread (same warp does both producer and consumer)
+    # This matches v7 structure but with 2-stage buffering
+    ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
 
     # Create TMA-UMMA pipeline with 2-stage buffering
     ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
@@ -462,38 +461,38 @@ def kernel(
     tBgSFB = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
     # =========================================================================
-    # MAIN LOOP (S13) - TRUE Warp-Specialized Producer/Consumer
+    # MAIN LOOP (S13) - 2-Stage Pipelined (Single Warp)
     # =========================================================================
     #
-    # ARCHITECTURE: Separate code paths for producer and consumer warps
+    # ARCHITECTURE: Warp 0 does both producer and consumer with 2-stage buffer
     #
-    # Timeline visualization:
-    #   Warp 0 (Producer): [load 0][load 1][load 2][load 3]...
-    #                          ↓       ↓       ↓       ↓
-    #   Warp 1 (Consumer):     [wait][mma 0][mma 1][mma 2]...
+    # Timeline visualization (2-stage pipeline):
+    #   Stage 0: [load 0]      [load 2]      [load 4]
+    #   Stage 1:      [load 1]      [load 3]      [load 5]
+    #   Compute:  [mma 0][mma 1][mma 2][mma 3][mma 4][mma 5]
     #
-    # Warp 0 races ahead with TMA loads while Warp 1 computes on buffered data.
-    # The 2-stage pipeline enables this overlap.
+    # While waiting for stage N data, stage N+1 TMA is already in flight.
+    # This hides some TMA latency with compute.
     #
     # =========================================================================
 
-    # Pre-compute values needed by both producer and consumer
-    num_kblocks = cute.size(tCrA, mode=[2])
+    if warp_idx == 0:
+        # Acquire accumulator slot (for epilogue synchronization)
+        acc_empty = acc_producer.acquire_and_advance()
 
-    if warp_idx == WARP_PRODUCER:
-        # =====================================================================
-        # PRODUCER WARP (Warp 0) - TMA Loads ONLY
-        # =====================================================================
-        # Producer races ahead, issuing TMA loads for all K-tiles.
-        # Does NOT wait for data - just issues async loads and signals barriers.
-        # =====================================================================
+        # Initialize MMA to not accumulate on first tile
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+        # Pre-compute number of k-blocks per tile
+        num_kblocks = cute.size(tCrA, mode=[2])
 
         for k_tile in range(k_tile_cnt):
-            # Acquire empty buffer slot (blocks if all stages full)
+            # =====================================================================
+            # PRODUCER PHASE: Acquire slot and issue TMA loads
+            # =====================================================================
             ab_empty = ab_producer.acquire_and_advance()
 
-            # Issue TMA loads for all 4 tensors (async, non-blocking)
-            # The TMA engine will signal ab_empty.barrier when each completes
+            # Issue TMA loads for all 4 tensors (async)
             cute.copy(tma_atom_a, tAgA[(None, k_tile)], tAsA[(None, ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
                 tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_a_gmem_ptr, cute.AddressSpace.generic))
@@ -507,25 +506,9 @@ def kernel(
                 tma_bar_ptr=ab_empty.barrier,
                 tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
 
-            # NOTE: No wait, no compute - producer just issues loads and moves on
-            # Consumer warp will wait for data and compute
-
-    elif warp_idx == WARP_CONSUMER:
-        # =====================================================================
-        # CONSUMER WARP (Warp 1) - MMA Compute ONLY
-        # =====================================================================
-        # Consumer waits for producer's data, computes, and releases buffers.
-        # Manages the accumulator pipeline for epilogue.
-        # =====================================================================
-
-        # Acquire accumulator slot (for epilogue synchronization)
-        acc_empty = acc_producer.acquire_and_advance()
-
-        # Initialize MMA to not accumulate on first tile
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
-        for k_tile in range(k_tile_cnt):
-            # Wait for producer to signal data ready
+            # =====================================================================
+            # CONSUMER PHASE: Wait for data, compute, release
+            # =====================================================================
             ab_full = ab_consumer.wait_and_advance()
 
             # Copy scale factors from shared memory to tensor memory (S2T)
@@ -544,13 +527,11 @@ def kernel(
                 cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-            # Release buffer slot so producer can reuse it
+            # Release buffer slot
             ab_full.release()
 
         # Signal accumulator ready for epilogue
         acc_empty.commit()
-
-    # Warps 2-3 are idle during main loop (reserved for future epilogue overlap)
 
     # =========================================================================
     # EPILOGUE (S14)
