@@ -200,10 +200,10 @@ def kernel_cutlass_pattern(
     tCtSFB_compact_s2t = thr_copy_s2t_sfb.partition_D(tCtSFB_compact)
 
     # Create pipeline state objects (CUTLASS pattern)
-    ab_producer_state = pipeline.make_pipeline_state(ab_pipeline)
-    ab_consumer_state = pipeline.make_pipeline_state(ab_pipeline)
-    acc_producer_state = pipeline.make_pipeline_state(acc_pipeline)
-    acc_consumer_state = pipeline.make_pipeline_state(acc_pipeline)
+    ab_producer_state = pipeline.make_pipeline_state(ab_pipeline, num_ab_stage)
+    ab_consumer_state = pipeline.make_pipeline_state(ab_pipeline, num_ab_stage)
+    acc_producer_state = pipeline.make_pipeline_state(acc_pipeline, num_acc_stage)
+    acc_consumer_state = pipeline.make_pipeline_state(acc_pipeline, num_acc_stage)
 
     # =========================================================================
     # PERSISTENT TILE LOOP
