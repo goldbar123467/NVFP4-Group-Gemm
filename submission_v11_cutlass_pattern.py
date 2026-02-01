@@ -303,8 +303,9 @@ def kernel_cutlass_pattern(
                 # Acquire producer slot
                 ab_pipeline.producer_acquire(ab_producer_state)
 
-                stage_idx = ab_producer_state.index()
-                barrier_ptr = ab_pipeline.producer_get_barrier(ab_producer_state)
+                stage_idx = ab_producer_state.index
+                # Compute barrier pointer from storage base + stage offset
+                barrier_ptr = storage.ab_mbar_ptr.data_ptr() + stage_idx * 2
 
                 cute.copy(tma_atom_a, tAgA_tile[(None, k_tile)], tAsA[(None, stage_idx)],
                     tma_bar_ptr=barrier_ptr,
@@ -333,7 +334,7 @@ def kernel_cutlass_pattern(
             for k_tile in range(k_tile_cnt):
                 # Wait for data from TMA warp
                 ab_pipeline.consumer_wait(ab_consumer_state)
-                stage_idx = ab_consumer_state.index()
+                stage_idx = ab_consumer_state.index
 
                 # S2T copies
                 s2t_stage_coord = (None, None, None, None, stage_idx)
@@ -355,7 +356,7 @@ def kernel_cutlass_pattern(
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()
 
-            acc_producer_state.commit()
+            acc_pipeline.producer_commit(acc_producer_state)
 
         # =====================================================================
         # EPILOGUE - All warps participate (focus on warps 0-3)
