@@ -2,11 +2,9 @@
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
 True Warp-Specialized Implementation using CuTe DSL
 
-VERSION: v10-gated-fixes
-CHANGES: Gate 0 — correctness (cache key collision fix, dead subtraction removal),
-         Gate 1 — proper kernel cache keying on full problem dimensions,
-         Gate 2 — Triton fused SiLU kernel replacing torch.compile FP32 round-trip
-NOTE:    Predicate axis order (residue_n, residue_m) preserved — see epilogue comments.
+VERSION: v9-warpspec-fixed
+CHANGES: True warp specialization (separate producer/consumer warps),
+         fast-path unpredicated epilogue, fused SiLU gating
 """
 
 import cutlass
@@ -142,10 +140,6 @@ def kernel(
             if not find:
                 coord_y = cta_rest // cta_m
                 coord_x = cta_rest % cta_m
-                # NOTE: This subtraction looks dead but is a LOOP GUARD.
-                # It drives cta_rest negative so subsequent iterations never
-                # satisfy `cta_rest >= cta_m * cta_n`, preventing group_idx
-                # from being incorrectly incremented for multi-group problems.
                 cta_rest -= cta_m * cta_n
                 find = True
 
@@ -587,10 +581,6 @@ def kernel(
         tDcC = thr_copy_r2g.partition_D(cC)
         tDpC = cute.make_rmem_tensor(tDrC.shape, cutlass.Boolean)
         for i in range(cute.size(tDrC.shape)):
-            # NOTE: Axis order is (residue_n, residue_m) because tDcC is partitioned
-            # via thr_copy_r2g (SIMT R2G) which distributes along stride-1 (N-axis) first.
-            # After partition_D, coordinate[0] maps to N and coordinate[1] maps to M.
-            # Verified empirically on B200 hardware — do NOT swap without re-testing.
             tDpC[i] = cute.elem_less(tDcC[i], (residue_n, residue_m))
         cute.copy(simt_atom, cute.flatten(tDrC), cute.flatten(tDgC), pred=cute.flatten(tDpC))
 
@@ -714,51 +704,10 @@ def my_kernel(
 # PYTHON RUNTIME (S16)
 # =============================================================================
 
-try:
-    import triton
-    import triton.language as tl
-    _HAS_TRITON = True
-except ImportError:
-    _HAS_TRITON = False
-
-
-if _HAS_TRITON:
-    @triton.jit
-    def _silu_gate_kernel(
-        t1_ptr, t2_ptr, out_ptr,
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """Fused SiLU gating: out = silu(t1) * t2, FP16 I/O with FP32 accumulation for sigmoid."""
-        pid = tl.program_id(0)
-        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_elements
-
-        t1 = tl.load(t1_ptr + offsets, mask=mask).to(tl.float32)
-        t2 = tl.load(t2_ptr + offsets, mask=mask).to(tl.float32)
-
-        silu_val = t1 * tl.sigmoid(t1)
-        result = silu_val * t2
-
-        tl.store(out_ptr + offsets, result.to(tl.float16), mask=mask)
-
-
+@torch.compile(mode="reduce-overhead")
 def _fused_silu_gate(temp1, temp2, out_dtype):
-    """Fused SiLU gating: silu(temp1) * temp2."""
-    if _HAS_TRITON:
-        output = torch.empty_like(temp1, dtype=out_dtype)
-        n_elements = temp1.numel()
-        BLOCK_SIZE = 1024
-        grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-        _silu_gate_kernel[grid](
-            temp1, temp2, output,
-            n_elements,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-        return output
-    else:
-        # Fallback: plain torch, no torch.compile overhead
-        return (torch.nn.functional.silu(temp1.float()) * temp2.float()).to(out_dtype)
+    """Fused SiLU gating: silu(temp1) * temp2 in single kernel launch."""
+    return (torch.nn.functional.silu(temp1.float()) * temp2.float()).to(out_dtype)
 
 
 _compiled_kernel_cache = {}
@@ -802,8 +751,8 @@ def run_single_gemm(a, b, sfa_perm, sfb_perm, output, problem_sizes):
     tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
     tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
 
-    cta_tile_shape_mn = (128, mma_tiler_mnk[1])
-    cluster_tile_shape_mn = cta_tile_shape_mn
+    cta_tile_shape_mn = [128, mma_tiler_mnk[1]]
+    cluster_tile_shape_mn = tuple(x * y for x, y in zip(cta_tile_shape_mn, (1, 1)))
 
     total_num_clusters = 0
     num_groups = len(problem_sizes)
@@ -873,8 +822,8 @@ def custom_kernel(data: input_t) -> output_t:
         tensor_of_abc_ptrs = torch.tensor(abc_ptrs, dtype=torch.int64, device="cuda")
         tensor_of_sfasfb_ptrs = torch.tensor(sfasfb_ptrs, dtype=torch.int64, device="cuda")
 
-        cta_tile_shape_mn = (128, mma_tiler_mnk[1])
-        cluster_tile_shape_mn = cta_tile_shape_mn
+        cta_tile_shape_mn = [128, mma_tiler_mnk[1]]
+        cluster_tile_shape_mn = tuple(x * y for x, y in zip(cta_tile_shape_mn, (1, 1)))
 
         total_num_clusters = 0
         for m, n, _, _ in problem_sizes:
