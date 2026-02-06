@@ -1,9 +1,10 @@
 """
 NVFP4 Block-Scaled Group GEMM for NVIDIA B200
-Warp-Specialized Implementation using CuTe DSL
+True Warp-Specialized Implementation using CuTe DSL
 
-VERSION: v8-warpspec
-CHANGES: True warp specialization with separate producer/consumer loops
+VERSION: v9-warpspec-fixed
+CHANGES: True warp specialization (separate producer/consumer warps),
+         fast-path unpredicated epilogue, fused SiLU gating
 """
 
 import cutlass
@@ -104,12 +105,12 @@ def kernel(
     num_tma_load_bytes: cutlass.Constexpr[int],
 ):
     """
-    Warp-Specialized NVFP4 Group GEMM Kernel
+    True Warp-Specialized NVFP4 Group GEMM Kernel
 
     Warp Roles:
-    - Warp 0 (WARP_PRODUCER): Issues TMA loads, manages producer pipeline
-    - Warp 1 (WARP_CONSUMER): Executes MMA compute, manages consumer pipeline
-    - Warps 2-3: Reserved for epilogue (currently idle during mainloop)
+    - Warp 0 (PRODUCER): Issues TMA loads only, runs ahead filling pipeline
+    - Warp 1 (CONSUMER): Executes MMA compute only, chases producer
+    - Warps 2-3: Idle during mainloop, participate in epilogue store
     """
     # -------------------------------------------------------------------------
     # Thread/Warp Identification
@@ -262,8 +263,8 @@ def kernel(
     # Producer group: Warp 0 issues TMA commands
     ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-    # Consumer group: Single thread (same warp does both producer and consumer)
-    # This matches v7 structure but with 2-stage buffering
+    # Consumer group: Single thread from consumer warp issues MMA
+    # Warp 1 waits on barriers and drives UMMA compute
     ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
 
     # Create TMA-UMMA pipeline with 2-stage buffering
@@ -461,38 +462,33 @@ def kernel(
     tBgSFB = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
     # =========================================================================
-    # MAIN LOOP (S13) - 2-Stage Pipelined (Single Warp)
+    # MAIN LOOP (S13) - True Warp-Specialized 2-Stage Pipeline
     # =========================================================================
     #
-    # ARCHITECTURE: Warp 0 does both producer and consumer with 2-stage buffer
+    # ARCHITECTURE: Warp 0 = Producer (TMA only), Warp 1 = Consumer (MMA only)
     #
-    # Timeline visualization (2-stage pipeline):
-    #   Stage 0: [load 0]      [load 2]      [load 4]
-    #   Stage 1:      [load 1]      [load 3]      [load 5]
-    #   Compute:  [mma 0][mma 1][mma 2][mma 3][mma 4][mma 5]
+    # Timeline (true overlap):
+    #   Warp 0: [load 0][load 1][load 2][load 3]...  (runs ahead)
+    #   Warp 1:         [mma 0][mma 1][mma 2][mma 3]... (chases)
     #
-    # While waiting for stage N data, stage N+1 TMA is already in flight.
-    # This hides some TMA latency with compute.
+    # Producer acquires empty slot → issues 4 TMA loads → loops immediately.
+    # Consumer waits for full slot → S2T + MMA → releases slot → loops.
+    # 2-stage buffer: producer can be 1 tile ahead of consumer at all times.
+    # Warps 2-3: idle during mainloop, participate in epilogue.
     #
     # =========================================================================
+
+    # Pre-compute number of k-blocks per tile (needed by consumer)
+    num_kblocks = cute.size(tCrA, mode=[2])
 
     if warp_idx == 0:
-        # Acquire accumulator slot (for epilogue synchronization)
-        acc_empty = acc_producer.acquire_and_advance()
-
-        # Initialize MMA to not accumulate on first tile
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
-        # Pre-compute number of k-blocks per tile
-        num_kblocks = cute.size(tCrA, mode=[2])
-
+        # =================================================================
+        # WARP 0 — PRODUCER: TMA loads only, runs ahead of consumer
+        # =================================================================
         for k_tile in range(k_tile_cnt):
-            # =====================================================================
-            # PRODUCER PHASE: Acquire slot and issue TMA loads
-            # =====================================================================
             ab_empty = ab_producer.acquire_and_advance()
 
-            # Issue TMA loads for all 4 tensors (async)
+            # Issue TMA loads for all 4 tensors (async, non-blocking)
             cute.copy(tma_atom_a, tAgA[(None, k_tile)], tAsA[(None, ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
                 tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_a_gmem_ptr, cute.AddressSpace.generic))
@@ -505,13 +501,23 @@ def kernel(
             cute.copy(tma_atom_sfb, tBgSFB[(None, k_tile)], tBsSFB[(None, ab_empty.index)],
                 tma_bar_ptr=ab_empty.barrier,
                 tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
+            # Producer does NOT wait — loops back to acquire next slot immediately
 
-            # =====================================================================
-            # CONSUMER PHASE: Wait for data, compute, release
-            # =====================================================================
+    elif warp_idx == 1:
+        # =================================================================
+        # WARP 1 — CONSUMER: MMA compute only, chases producer
+        # =================================================================
+        # Acquire accumulator slot (signals epilogue when all k-tiles done)
+        acc_empty = acc_producer.acquire_and_advance()
+
+        # First tile: overwrite accumulator (no accumulate)
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+        for k_tile in range(k_tile_cnt):
+            # Wait for producer to fill this stage
             ab_full = ab_consumer.wait_and_advance()
 
-            # Copy scale factors from shared memory to tensor memory (S2T)
+            # Copy scale factors: shared memory → tensor memory (S2T)
             s2t_stage_coord = (None, None, None, None, ab_full.index)
             tCsSFA_compact_s2t_staged = tCsSFA_compact_s2t[s2t_stage_coord]
             tCsSFB_compact_s2t_staged = tCsSFB_compact_s2t[s2t_stage_coord]
@@ -527,11 +533,13 @@ def kernel(
                 cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-            # Release buffer slot
+            # Release buffer slot back to producer
             ab_full.release()
 
         # Signal accumulator ready for epilogue
         acc_empty.commit()
+
+    # Warps 2-3: skip mainloop entirely, proceed to epilogue wait
 
     # =========================================================================
     # EPILOGUE (S14)
@@ -559,15 +567,21 @@ def kernel(
     value_layout = cute.make_layout((1, 1))
     tiled_copy_r2g = cute.make_tiled_copy_tv(simt_atom, thread_layout, value_layout)
     thr_copy_r2g = tiled_copy_r2g.get_slice(tidx)
-    cC = cute.make_identity_tensor(gC_mnl.shape)
-    tDcC = thr_copy_r2g.partition_D(cC)
-
-    tDpC = cute.make_rmem_tensor(tDrC.shape, cutlass.Boolean)
+    # Fast-path: skip predicate construction for full (non-boundary) tiles
     residue_m = mC_mnl.shape[0] - cutlass.Int32(coord_x) * mma_tiler_mnk[0]
     residue_n = mC_mnl.shape[1] - cutlass.Int32(coord_y) * mma_tiler_mnk[1]
-    for i in range(cute.size(tDrC.shape)):
-        tDpC[i] = cute.elem_less(tDcC[i], (residue_n, residue_m))
-    cute.copy(simt_atom, cute.flatten(tDrC), cute.flatten(tDgC), pred=cute.flatten(tDpC))
+
+    if residue_m >= mma_tiler_mnk[0] and residue_n >= mma_tiler_mnk[1]:
+        # Full tile — unpredicated vectorized store
+        cute.copy(simt_atom, cute.flatten(tDrC), cute.flatten(tDgC))
+    else:
+        # Boundary tile — predicated store with residue masking
+        cC = cute.make_identity_tensor(gC_mnl.shape)
+        tDcC = thr_copy_r2g.partition_D(cC)
+        tDpC = cute.make_rmem_tensor(tDrC.shape, cutlass.Boolean)
+        for i in range(cute.size(tDrC.shape)):
+            tDpC[i] = cute.elem_less(tDcC[i], (residue_n, residue_m))
+        cute.copy(simt_atom, cute.flatten(tDrC), cute.flatten(tDgC), pred=cute.flatten(tDpC))
 
     acc_full.release()
     cute.arch.barrier()
@@ -688,6 +702,12 @@ def my_kernel(
 # =============================================================================
 # PYTHON RUNTIME (S16)
 # =============================================================================
+
+@torch.compile(mode="reduce-overhead")
+def _fused_silu_gate(temp1, temp2, out_dtype):
+    """Fused SiLU gating: silu(temp1) * temp2 in single kernel launch."""
+    return (torch.nn.functional.silu(temp1.float()) * temp2.float()).to(out_dtype)
+
 
 _compiled_kernel_cache = {}
 
@@ -859,13 +879,8 @@ def custom_kernel(data: input_t) -> output_t:
         # Pass 2: GEMM2 = A @ B2
         run_single_gemm(a, b2, sfa_perm, sfb2_perm, temp2, problem_sizes)
 
-        # Fuse: C = silu(GEMM1) * GEMM2
-        temp1_fp32 = temp1.float()
-        temp2_fp32 = temp2.float()
-        result = (torch.nn.functional.silu(temp1_fp32) * temp2_fp32).to(c.dtype)
-
-        # Copy result to output tensor
-        c.copy_(result)
+        # Fused: C = silu(GEMM1) * GEMM2 (single kernel launch)
+        c.copy_(_fused_silu_gate(temp1, temp2, c.dtype))
 
         return c
 
