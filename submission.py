@@ -143,14 +143,14 @@ def kernel_persistent(
     sSFB = smem.allocate_tensor(element_type=sf_dtype, layout=sfb_smem_layout_staged,
         byte_alignment=128)
 
-    # --- Pipeline Creation (new API: no make_participants) ---
-    ab_pipeline = pipeline.PipelineTmaUmma.create(
+    # --- Pipeline Creation (HYBRID: participants for AB, state for ACC) ---
+    ab_producer, ab_consumer = pipeline.PipelineTmaUmma.create(
         barrier_storage=storage.ab_mbar_ptr.data_ptr(),
         num_stages=num_ab_stage,
         producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
         consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
         tx_count=num_tma_load_bytes,
-    )
+    ).make_participants()
     acc_pipeline = pipeline.PipelineUmmaAsync.create(
         barrier_storage=storage.acc_mbar_ptr.data_ptr(),
         num_stages=num_acc_stage,
@@ -158,9 +158,8 @@ def kernel_persistent(
         consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, threads_per_cta),
     )
 
-    # Pipeline states (support reset_count for persistent loop)
-    ab_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, num_ab_stage)
-    ab_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, num_ab_stage)
+    # AB pipeline: uses participant objects (ab_producer, ab_consumer) — no explicit states
+    # ACC pipeline: uses state API (needed for producer_commit/producer_tail)
     acc_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, num_acc_stage)
     acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, num_acc_stage)
 
@@ -359,8 +358,8 @@ def kernel_persistent(
         tBgSFB_tile = tBgSFB[(None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])]
 
         # --- Reset pipeline states for new tile ---
-        ab_producer_state.reset_count()
-        ab_consumer_state.reset_count()
+        ab_producer.reset()
+        ab_consumer.reset()
         acc_producer_state.reset_count()
         acc_consumer_state.reset_count()
 
@@ -371,24 +370,20 @@ def kernel_persistent(
         if warp_idx == 0:
             # WARP 0 — TMA PRODUCER: loads only, runs ahead
             for k_tile in range(k_tile_cnt):
-                ab_pipeline.producer_acquire(ab_producer_state)
-                barrier = ab_pipeline.producer_get_barrier(ab_producer_state)
-                stage_idx = ab_producer_state.index
+                ab_empty = ab_producer.acquire_and_advance()
 
-                cute.copy(tma_atom_a, tAgA_tile[(None, k_tile)], tAsA[(None, stage_idx)],
-                    tma_bar_ptr=barrier,
+                cute.copy(tma_atom_a, tAgA_tile[(None, k_tile)], tAsA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
                     tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_a_gmem_ptr, cute.AddressSpace.generic))
-                cute.copy(tma_atom_b, tBgB_tile[(None, k_tile)], tBsB[(None, stage_idx)],
-                    tma_bar_ptr=barrier,
+                cute.copy(tma_atom_b, tBgB_tile[(None, k_tile)], tBsB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
                     tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_b_gmem_ptr, cute.AddressSpace.generic))
-                cute.copy(tma_atom_sfa, tAgSFA_tile[(None, k_tile)], tAsSFA[(None, stage_idx)],
-                    tma_bar_ptr=barrier,
+                cute.copy(tma_atom_sfa, tAgSFA_tile[(None, k_tile)], tAsSFA[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
                     tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfa_gmem_ptr, cute.AddressSpace.generic))
-                cute.copy(tma_atom_sfb, tBgSFB_tile[(None, k_tile)], tBsSFB[(None, stage_idx)],
-                    tma_bar_ptr=barrier,
+                cute.copy(tma_atom_sfb, tBgSFB_tile[(None, k_tile)], tBsSFB[(None, ab_empty.index)],
+                    tma_bar_ptr=ab_empty.barrier,
                     tma_desc_ptr=tensormap_manager.get_tensormap_ptr(tensormap_sfb_gmem_ptr, cute.AddressSpace.generic))
-
-                ab_producer_state.advance()
 
         elif warp_idx == 1:
             # WARP 1 — MMA CONSUMER: compute only, chases producer
@@ -396,25 +391,23 @@ def kernel_persistent(
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
             for k_tile in range(k_tile_cnt):
-                ab_pipeline.consumer_wait(ab_consumer_state)
-                stage_idx = ab_consumer_state.index
+                ab_full = ab_consumer.wait_and_advance()
 
                 # S2T: shared memory → tensor memory
-                s2t_stage_coord = (None, None, None, None, stage_idx)
+                s2t_stage_coord = (None, None, None, None, ab_full.index)
                 cute.copy(tiled_copy_s2t_sfa, tCsSFA_compact_s2t[s2t_stage_coord], tCtSFA_compact_s2t)
                 cute.copy(tiled_copy_s2t_sfb, tCsSFB_compact_s2t[s2t_stage_coord], tCtSFB_compact_s2t)
 
                 # MMA for all K-blocks in this tile
                 for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
-                    kblock_coord = (None, None, kblock_idx, stage_idx)
+                    kblock_coord = (None, None, kblock_idx, ab_full.index)
                     sf_kblock_coord = (None, None, kblock_idx)
                     tiled_mma.set(tcgen05.Field.SFA, tCtSFA[sf_kblock_coord].iterator)
                     tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
                     cute.gemm(tiled_mma, tCtAcc, tCrA[kblock_coord], tCrB[kblock_coord], tCtAcc)
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
-                ab_pipeline.consumer_release(ab_consumer_state)
-                ab_consumer_state.advance()
+                ab_full.release()
 
             acc_pipeline.producer_commit(acc_producer_state)
             acc_producer_state.advance()
@@ -452,13 +445,13 @@ def kernel_persistent(
         acc_pipeline.consumer_release(acc_consumer_state)
         acc_consumer_state.advance()
 
-        cute.arch.barrier()  # Sync all warps before next tile
+        # Pipeline mbarriers handle inter-warp sync — no explicit barrier needed
 
     # =========================================================================
     # CLEANUP (after all tiles)
     # =========================================================================
     if warp_idx == 0:
-        ab_pipeline.producer_tail(ab_producer_state)
+        ab_producer.tail()
     tmem.relinquish_alloc_permit()
     tmem.free(acc_tmem_ptr)
 
